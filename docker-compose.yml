@@ -1,34 +1,89 @@
 version: '3.9'
 
 services:
-  mongo:
-    image: mongo:7
+  # MongoDB Database
+  mongodb:
+    image: mongo:7.0
+    container_name: analytics-mongodb
     restart: unless-stopped
     ports:
       - '27017:27017'
-    volumes:
-      - mongo_data:/data/db
-
-  backend:
-    build: ./backend
-    restart: unless-stopped
-    depends_on:
-      - mongo
     environment:
-      PORT: 4000
-      MONGODB_URI: mongodb://mongo:27017/analytics
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin
+      MONGO_INITDB_DATABASE: analytics
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    networks:
+      - analytics_network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Node.js Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: analytics-backend
+    restart: unless-stopped
     ports:
       - '4000:4000'
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      NODE_ENV: development
+      MONGODB_URI: mongodb://admin:admin@mongodb:27017/analytics?authSource=admin
+      FRONTEND_URL: http://localhost:3000
+    networks:
+      - analytics_network
+    healthcheck:
+      test: curl -f http://localhost:4000/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # React Frontend Dashboard
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: analytics-frontend
     restart: unless-stopped
+    ports:
+      - '3000:3000'
     depends_on:
       - backend
     environment:
       REACT_APP_API_URL: http://localhost:4000
+      CI: false
+    networks:
+      - analytics_network
+
+  # Demo Page Server
+  demo:
+    image: node:18-alpine
+    container_name: analytics-demo
+    restart: unless-stopped
     ports:
-      - '3000:3000'
+      - '8000:8000'
+    working_dir: /app
+    command: npx http-server /app/demo -p 8000 -c-1 --cors
+    volumes:
+      - ./demo:/app/demo
+      - ./tracker:/app/tracker
+    networks:
+      - analytics_network
+
+networks:
+  analytics_network:
+    driver: bridge
 
 volumes:
-  mongo_data:
+  mongodb_data:
+  mongodb_config:
