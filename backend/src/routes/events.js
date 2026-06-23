@@ -1,13 +1,26 @@
 const express = require('express');
 const router = express.Router();
 const Event = require('../models/Event');
+const Session = require('../models/Session');
+const { validateEvent } = require('../middleware/validation');
 
-// POST /api/events — ingest one or more events
-router.post('/', async (req, res) => {
+/**
+ * POST /api/events — Ingest one or more events and update session data
+ * @body {Object|Array} - Single event object or array of event objects
+ */
+router.post('/', async (req, res, next) => {
   try {
     const payload = req.body;
     const events = Array.isArray(payload) ? payload : [payload];
 
+    if (events.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'No events provided' },
+      });
+    }
+
+    // Map and validate events
     const docs = events.map((e) => ({
       session_id: e.session_id,
       event_type: e.event_type,
@@ -17,78 +30,151 @@ router.post('/', async (req, res) => {
       y: e.y ?? null,
       viewport_width: e.viewport_width ?? null,
       viewport_height: e.viewport_height ?? null,
-      user_agent: req.headers['user-agent'] ?? null,
+      user_agent: e.user_agent || req.headers['user-agent'] || null,
     }));
 
-    await Event.insertMany(docs, { ordered: false });
-    return res.status(201).json({ saved: docs.length });
+    // Bulk insert events
+    const savedEvents = await Event.insertMany(docs, { ordered: false });
+
+    // Update or create session documents
+    const sessionUpdates = {};
+    docs.forEach((doc) => {
+      if (!sessionUpdates[doc.session_id]) {
+        sessionUpdates[doc.session_id] = {
+          session_id: doc.session_id,
+          timestamps: [],
+          pages: new Set(),
+          page_views: 0,
+          clicks: 0,
+          user_agent: doc.user_agent,
+        };
+      }
+      sessionUpdates[doc.session_id].timestamps.push(doc.timestamp);
+      sessionUpdates[doc.session_id].pages.add(doc.page_url);
+      if (doc.event_type === 'page_view') sessionUpdates[doc.session_id].page_views++;
+      if (doc.event_type === 'click') sessionUpdates[doc.session_id].clicks++;
+    });
+
+    // Bulk update sessions
+    for (const [sessionId, data] of Object.entries(sessionUpdates)) {
+      await Session.findOneAndUpdate(
+        { session_id: sessionId },
+        {
+          $set: {
+            first_event: Math.min(...data.timestamps),
+            last_event: Math.max(...data.timestamps),
+            user_agent: data.user_agent,
+            pages_visited: Array.from(data.pages),
+          },
+          $inc: {
+            event_count: data.page_views + data.clicks,
+            page_count: data.page_views,
+            click_count: data.clicks,
+          },
+        },
+        { upsert: true, new: true }
+      );
+    }
+
+    return res.status(201).json({
+      success: true,
+      data: {
+        saved: savedEvents.length,
+        sessions_updated: Object.keys(sessionUpdates).length,
+      },
+    });
   } catch (err) {
     console.error('POST /events error:', err.message);
-    return res.status(500).json({ error: 'Failed to save events' });
+    next(err);
   }
 });
 
-// GET /api/events/sessions — list all sessions with event counts + last seen
-router.get('/sessions', async (req, res) => {
+/**
+ * GET /api/events/sessions — List all sessions with event counts and metadata
+ * @query {limit, skip, sortBy} - Pagination and sorting options
+ */
+router.get('/sessions', async (req, res, next) => {
   try {
-    const sessions = await Event.aggregate([
-      {
-        $group: {
-          _id: '$session_id',
-          total_events: { $sum: 1 },
-          page_views: {
-            $sum: { $cond: [{ $eq: ['$event_type', 'page_view'] }, 1, 0] },
-          },
-          clicks: {
-            $sum: { $cond: [{ $eq: ['$event_type', 'click'] }, 1, 0] },
-          },
-          first_seen: { $min: '$timestamp' },
-          last_seen: { $max: '$timestamp' },
-          pages_visited: { $addToSet: '$page_url' },
-        },
-      },
-      { $sort: { last_seen: -1 } },
-      {
-        $project: {
-          session_id: '$_id',
-          _id: 0,
-          total_events: 1,
-          page_views: 1,
-          clicks: 1,
-          first_seen: 1,
-          last_seen: 1,
-          pages_count: { $size: '$pages_visited' },
-        },
-      },
-    ]);
+    const { limit = 50, skip = 0, sortBy = 'last_event' } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 50, 500);
+    const skipNum = parseInt(skip) || 0;
 
-    return res.json(sessions);
+    const sessions = await Session.find({})
+      .sort({ [sortBy]: -1 })
+      .limit(limitNum)
+      .skip(skipNum)
+      .select('-__v')
+      .lean();
+
+    const total = await Session.countDocuments();
+
+    return res.json({
+      success: true,
+      data: sessions,
+      pagination: {
+        total,
+        limit: limitNum,
+        skip: skipNum,
+      },
+    });
   } catch (err) {
     console.error('GET /sessions error:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch sessions' });
+    next(err);
   }
 });
 
-// GET /api/events/session/:sessionId — full event journey for a session
-router.get('/session/:sessionId', async (req, res) => {
+/**
+ * GET /api/events/session/:sessionId — Fetch complete event journey for a session
+ * @param {String} sessionId - Session identifier
+ */
+router.get('/session/:sessionId', async (req, res, next) => {
   try {
-    const events = await Event.find({ session_id: req.params.sessionId })
+    const { sessionId } = req.params;
+
+    // Get session metadata
+    const session = await Session.findOne({ session_id: sessionId }).lean();
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Session not found' },
+      });
+    }
+
+    // Get all events in chronological order
+    const events = await Event.find({ session_id: sessionId })
       .sort({ timestamp: 1 })
       .select('-__v -updatedAt')
       .lean();
 
-    return res.json(events);
+    return res.json({
+      success: true,
+      data: {
+        session,
+        events,
+      },
+    });
   } catch (err) {
     console.error('GET /session/:id error:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch session events' });
+    next(err);
   }
 });
 
-// GET /api/events/heatmap?url=<encoded_url> — click coords for a given page
-router.get('/heatmap', async (req, res) => {
+/**
+ * GET /api/events/heatmap — Fetch click coordinates for heatmap visualization
+ * @query {url} - Page URL to fetch clicks for
+ * @query {limit} - Max results (default 5000)
+ */
+router.get('/heatmap', async (req, res, next) => {
   try {
     const { url } = req.query;
-    if (!url) return res.status(400).json({ error: 'url query param required' });
+    const { limit = 5000 } = req.query;
+
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'url query parameter is required' },
+      });
+    }
 
     const clicks = await Event.find({
       event_type: 'click',
@@ -97,22 +183,49 @@ router.get('/heatmap', async (req, res) => {
       y: { $ne: null },
     })
       .select('x y viewport_width viewport_height timestamp -_id')
+      .limit(Math.min(parseInt(limit) || 5000, 5000))
       .lean();
 
-    return res.json(clicks);
+    return res.json({
+      success: true,
+      data: {
+        url,
+        click_count: clicks.length,
+        clicks,
+      },
+    });
   } catch (err) {
     console.error('GET /heatmap error:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch heatmap data' });
+    next(err);
   }
 });
 
-// GET /api/events/pages — distinct pages seen (for heatmap selector)
-router.get('/pages', async (req, res) => {
+/**
+ * GET /api/events/pages — Fetch distinct pages visited (for heatmap page selector)
+ */
+router.get('/pages', async (req, res, next) => {
   try {
     const pages = await Event.distinct('page_url');
-    return res.json(pages.sort());
+    const pageStats = await Event.aggregate([
+      {
+        $group: {
+          _id: '$page_url',
+          views: { $sum: 1 },
+          clicks: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'click'] }, 1, 0] },
+          },
+        },
+      },
+      { $sort: { views: -1 } },
+    ]);
+
+    return res.json({
+      success: true,
+      data: pageStats,
+    });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch pages' });
+    console.error('GET /pages error:', err.message);
+    next(err);
   }
 });
 
