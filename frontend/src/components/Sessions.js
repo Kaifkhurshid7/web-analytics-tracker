@@ -21,7 +21,7 @@ function duration(first, last) {
 }
 
 export function Sessions({ onHeatmap }) {
-  const { data: sessions, loading, error } = useFetch(() => api.getSessions());
+  const { data: sessions, loading, error } = useFetch(() => api.fetchSessions());
   const [selected, setSelected] = useState(null);
   const [journey, setJourney] = useState(null);
   const [journeyLoading, setJourneyLoading] = useState(false);
@@ -32,8 +32,8 @@ export function Sessions({ onHeatmap }) {
     setJourney(null);
     setJourneyLoading(true);
     try {
-      const events = await api.getSession(id);
-      setJourney(events);
+      const data = await api.fetchSessionDetails(id);
+      setJourney(data.events || []);
     } finally {
       setJourneyLoading(false);
     }

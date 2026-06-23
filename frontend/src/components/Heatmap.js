@@ -105,7 +105,7 @@ function HeatmapCanvas({ clicks }) {
 }
 
 export function Heatmap({ initialUrl }) {
-  const { data: pages, loading: pagesLoading } = useFetch(() => api.getPages());
+  const { data: pages, loading: pagesLoading } = useFetch(() => api.fetchPages());
   const [selectedUrl, setSelectedUrl] = useState(initialUrl || '');
   const [clicks, setClicks] = useState(null);
   const [clicksLoading, setClicksLoading] = useState(false);
@@ -116,8 +116,8 @@ export function Heatmap({ initialUrl }) {
     setClicksLoading(true);
     setClicksError(null);
     try {
-      const data = await api.getHeatmap(url);
-      setClicks(data);
+      const data = await api.fetchHeatmapData(url);
+      setClicks(data.clicks || []);
     } catch (e) {
       setClicksError(e.message);
     } finally {
